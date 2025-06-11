@@ -1,0 +1,283 @@
+name: vpp-verify-build-and-test
+
+on:
+  # Commenting out workflow_run trigger for testing
+  # workflow_run:
+  #   workflows: ["vpp-checkstyle"]
+  #   types:
+  #     - completed
+  # Enable manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual trigger'
+        required: false
+        default: 'Manual VPP Build and Test'
+
+jobs:
+  setup-env:
+    runs-on: self-hosted
+    outputs:
+      runner_ip: ${{ steps.set_vars.outputs.runner_ip }}
+      runner_name: ${{ steps.set_vars.outputs.runner_name }}
+    steps:
+      - name: Set runner info
+        id: set_vars
+        run: |
+          echo "runner_ip=$(hostname -I | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "runner_name=$(hostname)" >> $GITHUB_OUTPUT
+
+  vpp-verify:
+    needs: setup-env
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ${{ fromJson(format('["self-hosted", "builder-{0}"]', matrix.executor-arch)) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Define OS, branch, and architecture combinations to test (18 jobs)
+        os: ['ubuntu2404']
+        branch: ['master']
+        # os: ['ubuntu2404', 'ubuntu2204', 'debian12']
+        # branch: ['master', 'stable/2502', 'stable/2506']
+        executor-arch: ['x86_64', 'aarch64']
+        exclude:
+          - os: 'debian12'
+            executor-arch: 'aarch64'
+
+    container:
+      image: fdiotools/builder-${{ matrix.os }}:prod-${{ matrix.executor-arch }}
+      options: >-
+        --privileged 
+        -m16g 
+        --cpus=16 
+        -e HOST_IP=${{ needs.setup-env.outputs.runner_ip }}
+        -e HOST_HOSTNAME=${{ needs.setup-env.outputs.runner_name }}
+
+    env:
+      # VPP source directory path inside the container
+      VPP_SRC_DIR: /scratch/docker-build/vpp
+      # Ensures uniqueness per run
+      CACHE_DATE: ${{ github.run_id }}
+      STREAM: ${{ matrix.branch == 'master' && 'master' || matrix.branch == 'stable/2502' && '2502' || '2506' }}
+      MAKE_PARALLEL_JOBS: ${{ matrix.executor-arch == 'aarch64' && '16' || '16' }}
+      MAKE_TEST_OS: ${{ matrix.os == 'ubuntu2204' && 'ubuntu-22.04' || matrix.os == 'ubuntu2404' && 'ubuntu-24.04' || 'debian-12' }}
+      MAKE_TEST_MULTIWORKER_OS: 'debian-12'
+      VPPAPIGEN_TEST_OS: ${{ matrix.os == 'ubuntu2204' && 'ubuntu-22.04' || matrix.os == 'ubuntu2404' && 'ubuntu-24.04' || 'debian-12' }}
+      OS: ${{ matrix.os }}
+      EXECUTOR_ARCH: ${{ matrix.executor-arch }}
+      GERRIT_BRANCH: ${{ matrix.branch }}
+      BUILD_TIMEOUT: 120
+      DOCKER_TEST: 1
+      SHM_SIZE: ${{ matrix.executor-arch == 'aarch64' && '4096M' || '2048M' }}
+      OS_ID: ${{ matrix.os == 'debian12' && 'debian' || 'ubuntu' }}
+      OS_VERSION_ID: ${{ matrix.os == 'ubuntu2204' && '22.04' || matrix.os == 'ubuntu2404' && '24.04' || matrix.os == 'debian12' && '12' }}
+      OS_ARCH: ${{ matrix.executor-arch }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Build on ${{ matrix.os }} ${{ matrix.executor-arch }}
+        run: |
+          echo "Running on ${{ matrix.os }} ${{ matrix.executor-arch }}"
+
+      - name: Display platform fingerprint
+        timeout-minutes: 1
+        run: |
+          echo "Platform details:"
+          uname -a
+          lsb_release -a || true
+          echo "Host information:"
+          echo "Host IP: ${HOST_IP}"
+          echo "Host Hostname: ${HOST_HOSTNAME}"
+
+      - name: Display host resources
+        run: |
+          echo "CPU cores available:"
+          nproc
+          echo "Memory available:"
+          free -h
+          echo "Disk space:"
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker images
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          # Force a complete cache refresh by updating the .github/docker-version file
+          key: ${{ runner.os }}-buildx-${{ matrix.os }}-${{ matrix.executor-arch }}-${{ hashFiles('.github/docker-version') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ matrix.os }}-${{ matrix.executor-arch }}-
+            ${{ runner.os }}-buildx-
+
+      - name: Pull latest Docker image
+        timeout-minutes: 30
+        run: |
+          # Pull latest docker executor image
+          docker pull fdiotools/builder-${{ matrix.os }}:prod-${{ matrix.executor-arch }}
+
+      - name: Display all environment variables in the Docker Executor Container
+        timeout-minutes: 5
+        run: |
+          echo "=== All Docker executor environment variables ==="
+          env | sort
+
+      - name: Integrate latest code changes with Docker Executor VPP Workspace 
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          if [ -d "${VPP_SRC_DIR}" ]; then
+            echo "Using existing VPP repository at ${VPP_SRC_DIR}"
+            # Copy files from GitHub workspace to existing repo, but skip directories that already exist
+            for item in "$GITHUB_WORKSPACE"/*; do
+              base_name=$(basename "$item")
+              # Skip .git directory
+              if [[ "$base_name" == ".git" ]]; then
+                echo "Skipping .git directory"
+                continue
+              fi
+              # If it's a directory and already exists in destination, skip it
+              if [ -d "$item" ] && [ -d "${VPP_SRC_DIR}/${base_name}" ]; then
+                echo "Directory already exists, skipping: ${base_name}"
+              else
+                echo "Copying: ${base_name}"
+                cp -rf "$item" "${VPP_SRC_DIR}/"
+              fi
+            done
+          else
+            echo "ERROR: Expected VPP directory ${VPP_SRC_DIR} not found in container!"
+            echo "Container directory structure:"
+            find / -maxdepth 3 -type d 2>/dev/null | sort
+            exit 1
+          fi
+
+      - name: Set working directory
+        timeout-minutes: 1
+        run: |
+          cd ${VPP_SRC_DIR}
+          echo "Switched to repo: $(pwd)"
+
+      - name: Remount /dev/shm for Docker
+        timeout-minutes: 1
+        run: |
+          sudo mount -o remount /dev/shm -o size=${SHM_SIZE} || true
+
+      - name: Install VPP build dependencies
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ${VPP_SRC_DIR}
+          make UNATTENDED=yes install-dep
+          make UNATTENDED=yes install-ext-deps
+
+      - name: Build static vppctl
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ${VPP_SRC_DIR}
+          echo "Building static vppctl"
+          if [ -f extras/scripts/build_static_vppctl.sh ]; then
+            extras/scripts/build_static_vppctl.sh
+          else
+            echo "ERROR: Required script extras/scripts/build_static_vppctl.sh not found!"
+            exit 1
+          fi
+
+      - name: Install test dependencies
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ${VPP_SRC_DIR}
+          make UNATTENDED=yes test-dep
+
+      - name: Package verification
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ${VPP_SRC_DIR}
+          make UNATTENDED=yes pkg-verify
+
+      - name: Run vppapigen test (conditional)
+        if: contains(env.VPPAPIGEN_TEST_OS, format('{0}-{1}', env.OS_ID, env.OS_VERSION_ID))
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ${VPP_SRC_DIR}
+          src/tools/vppapigen/test_vppapigen.py
+
+      - name: Run make test
+        if: contains(env.MAKE_TEST_OS, format('{0}-{1}', env.OS_ID, env.OS_VERSION_ID))
+        timeout-minutes: 120
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ${VPP_SRC_DIR}
+          make COMPRESS_FAILED_TEST_LOGS=yes TEST_JOBS=${MAKE_PARALLEL_JOBS} RETRIES=3 UNATTENDED=yes FAILED_DIR=/tmp/vpp-failed-unittests test
+
+      - name: Run multiworker tests (conditional)
+        if: contains(env.MAKE_TEST_MULTIWORKER_OS, format('{0}-{1}', env.OS_ID, env.OS_VERSION_ID))
+        timeout-minutes: 120
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ${VPP_SRC_DIR}
+          if git grep -q VPP_WORKER_CONFIG ; then
+            make VPP_WORKER_CONFIG="workers 2" COMPRESS_FAILED_TEST_LOGS=yes RETRIES=3 TEST_JOBS=${MAKE_PARALLEL_JOBS} UNATTENDED=yes FAILED_DIR=/tmp/vpp-failed-unittests-multiworker test
+          elif git grep -q VPP_WORKER_COUNT ; then
+            make VPP_WORKER_COUNT="2" COMPRESS_FAILED_TEST_LOGS=yes RETRIES=3 TEST_JOBS=${MAKE_PARALLEL_JOBS} UNATTENDED=yes FAILED_DIR=/tmp/vpp-failed-unittests-multiworker test
+          else
+            echo "No worker config found, skipping multiworker test"
+          fi
+
+      - name: Sanitize PCAP filenames by removing colon
+        if: always()
+        timeout-minutes: 15
+        run: |
+          cd /tmp
+          echo "Sanitizing PCAP filenames in /tmp for upload"
+          if ls -d ./vpp-unittest-* >/dev/null 2>&1; then
+            find ./vpp-unittest-* -type f -name "*:*" 2>/dev/null | while read f; do
+              echo "Renaming: $f"
+              mv "$f" "$(echo $f | tr ':' '_')"
+            done
+            echo "Filename sanitization complete"
+          else
+            echo "No vpp-unittest-* directories found in /tmp, skipping PCAP filename sanitization"
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.branch }}-${{ matrix.executor-arch }}
+          path: |
+            /tmp/vpp-unittest-*/
+            /tmp/vpp-failed-unittests*/
+          retention-days: 10
+
+      - name: Report test success
+        if: success()
+        timeout-minutes: 1
+        run: |
+          echo "::notice title=Test Results::✅ All VPP tests have passed successfully on ${{ matrix.os }}-${{ matrix.branch }}-${{ matrix.executor-arch }}"
+          echo "==============================================="
+          echo "✅ SUCCESS: All VPP tests completed successfully!"
+          echo "OS: ${{ matrix.os }}"
+          echo "Branch: ${{ matrix.branch }}"
+          echo "Architecture: ${{ matrix.executor-arch }}"
+          echo "Host Runner Machine: ${HOST_HOSTNAME} (${HOST_IP})"
+          echo "==============================================="
+
+
+
