@@ -1,0 +1,37 @@
+name: vpp-verify-sandbox-build-and-test
+
+on:
+  # Enable manual trigger for sandbox testing
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to test (master, stable/2502, stable/2506)'
+        required: true
+        default: 'master'
+        type: choice
+        options:
+          - master
+          - stable/2502
+          - stable/2506
+      build_type:
+        description: 'Build type (debug or release)'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - debug
+          - release
+      reason:
+        description: 'Reason for manual trigger'
+        required: false
+        default: 'Manual VPP Build and Test (Sandbox)'
+
+jobs:
+  # Call the main vpp-verify workflow with sandbox builder_type
+  vpp-verify-sandbox:
+    uses: ./.github/workflows/vpp-verify.yml
+    with:
+      branch: ${{ github.event.inputs.branch }}
+      builder_type: 'sandbox'
+      build_type: ${{ github.event.inputs.build_type }}
+      reason: ${{ github.event.inputs.reason }}
