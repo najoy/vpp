@@ -55,7 +55,7 @@ start_container() {
   local image="fdiotools/builder-ubuntu${version}:prod-x86_64"
   echo "Starting Docker container from image: $image"
   docker pull $image
-  sudo docker run --privileged --shm-size=1024M -m24g $image
+  sudo docker run --privileged --shm-size=1024M -m24g $image /bin/bash -c "echo 'Container started successfully'; ls -la; uname -a"
 }
 
 # Display usage information

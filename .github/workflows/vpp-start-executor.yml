@@ -1,0 +1,81 @@
+---
+name: vpp-start-executor
+
+# Define triggers
+on:
+  # Primary trigger: when the vpp-checkstyle workflow completes
+  workflow_run:
+    workflows: ["vpp-checkstyle"]
+    types:
+      - completed
+  # Manual trigger via GitHub UI or API
+  workflow_dispatch:
+    # Add explicit input to ensure GitHub recognizes this trigger
+    inputs:
+      reason:
+        description: 'Reason for manual trigger'
+        required: false
+        default: 'Manual testing'
+
+jobs:
+  # Simple debug job that always runs to verify workflow file is valid
+  debug-job:
+    name: Debug Workflow Trigger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check event type
+        run: |
+          echo "Workflow was triggered by: ${{ github.event_name }}"
+          echo "Current timestamp: $(date -u)"
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            echo "Source workflow: ${{ github.event.workflow_run.name }}"
+            echo "Source workflow conclusion: ${{ github.event.workflow_run.conclusion }}"
+            echo "Source workflow id: ${{ github.event.workflow_run.id }}"
+            echo "Source workflow branch: ${{ github.event.workflow_run.head_branch }}"
+          fi
+
+  start-builder:
+    name: Start VPP Builder Container - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # Run if manually triggered or if the checkstyle workflow completed successfully
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Debug Event
+        run: |
+          echo "===== GITHUB CONTEXT ====="
+          echo "Event name: ${{ github.event_name }}"
+          echo "Workflow name: ${{ github.workflow }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "SHA: ${{ github.sha }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Event path: ${{ github.event_path }}"
+
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            echo "===== WORKFLOW_RUN EVENT DETAILS ====="
+            echo "Triggering workflow ID: ${{ github.event.workflow_run.id }}"
+            echo "Triggering workflow name: ${{ github.event.workflow_run.name }}"
+            echo "Triggering workflow conclusion: ${{ github.event.workflow_run.conclusion }}"
+            echo "Triggering workflow branch: ${{ github.event.workflow_run.head_branch }}"
+            echo "Triggering workflow repository: ${{ github.event.workflow_run.repository.full_name }}"
+            echo "Triggering workflow event: ${{ github.event.workflow_run.event }}"
+            echo "Triggering workflow run number: ${{ github.event.workflow_run.run_number }}"
+            echo "Triggering workflow URL: ${{ github.event.workflow_run.html_url }}"
+          fi
+          echo "===== FULL EVENT JSON ====="
+          echo "${{ toJson(github.event) }}"
+
+      - name: Start Builder Container
+        run: |
+          chmod +x .ci/scripts/vpp/start-builder-container.sh
+          # Extract OS version from runner name (e.g., ubuntu-22.04 -> 22.04)
+          OS_VERSION=$(echo ${{ matrix.os }} | cut -d'-' -f2)
+          .ci/scripts/vpp/start-builder-container.sh $OS_VERSION
